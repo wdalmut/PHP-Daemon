@@ -151,6 +151,11 @@ abstract class Core_Worker_Mediator
     public $shm;
 
     /**
+     * @var Core_Worker_Adapter
+     */
+    public $adapter;
+
+    /**
      * The number of allowed concurrent workers
      * @example Set the worker count using $this->workers();
      * @var int
@@ -237,10 +242,13 @@ abstract class Core_Worker_Mediator
     protected abstract function get_callback(stdClass $call);
 
 
-    public function __construct($alias, Core_Daemon $daemon) {
+    public function __construct($alias, Core_Daemon $daemon, Core_Worker_Adapter $adapter = Null) {
         $this->alias = $alias;
         $this->daemon = $daemon;
         $this->memory_allocation = 5 * 1024 * 1024;
+        if ($adapter === Null) {
+            $this->adapter = new Core_Worker_Adapter_Shm();
+        }
 
         $interval = $this->daemon->loop_interval();
         switch(true) {
