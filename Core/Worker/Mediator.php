@@ -20,8 +20,7 @@
  * @example $this->Acme->inline();
  *
  *
- * @todo A health-check feature that will listen for a Usr signal and dump vital stats (number of calls, average
- *       duration, average wait, etc) and most importantly make data-driven advice about the suggested memory allocation
+ * @todo Improve the dump() feature to include data-driven advice about the suggested memory allocation
  *       and number of workers. It's very hard for a novice to have any feeling for those things and they are vital to
  *       having a worker that runs flawlessly.
  *
@@ -130,9 +129,9 @@ abstract class Core_Worker_Mediator implements Core_ITask
      * @var array
      */
     public $error_counts = array(
-        'identifier' => 0,
-        'corruption' => 0,
-        'catchall'   => 0,
+        'communication' => 0,
+        'corruption'    => 0,
+        'catchall'      => 0,
     );
 
     /**
@@ -214,7 +213,7 @@ abstract class Core_Worker_Mediator implements Core_ITask
 
     /**
      * How big, at any time, can the IPC shared memory allocation be.
-     * Default is 5MB. May need to be increased if you are passing very large datasets as Arguments and Return values.
+     * Default is 5MB. Will need to be increased if you are passing large datasets as Arguments or Return values.
      * @example Allocate shared memory using $this->malloc();
      * @var float
      */
@@ -283,11 +282,17 @@ abstract class Core_Worker_Mediator implements Core_ITask
 
     public function setup() {
 
+        // This class implements both the Task and the Plugin interfaces. Like plugins, this setup() method will be
+        // called in the parent process during application init. Like tasks, this setup() method will be called right
+        // after the process is forked.
+
+        $that = $this;
         if ($this->is_parent) {
 
             // Use the ftok() method to create a deterministic memory address.
             // This is a bit ugly but ftok needs a filesystem path so we give it one using the daemon filename and
             // current worker alias.
+
             @mkdir('/tmp/.phpdaemon');
             $this->ftok = sprintf('/tmp/.phpdaemon/%s_%s', str_replace('/', '_', $this->daemon->filename()), $this->alias);
             if (!touch($this->ftok))
@@ -302,12 +307,17 @@ abstract class Core_Worker_Mediator implements Core_ITask
                 $this->ipc_destroy();
 
             $this->fork();
-            $this->daemon->on(Core_Daemon::ON_PREEXECUTE, array($this, 'run'));
+            $this->daemon->on(Core_Daemon::ON_PREEXECUTE,   array($this, 'run'));
+            $this->daemon->on(Core_Daemon::ON_IDLE,         array($this, 'garbage_collector'), ceil(30 / ($this->workers * 0.5)));  // Throttle the garbage collector
+            $this->daemon->on(Core_Daemon::ON_SIGNAL,       function($signal) use ($that) {
+                if ($signal == SIGUSR1)
+                    $that->dump();
+            });
             $this->ipc_create();
             $this->shm_init();
 
         } else {
-            unset($this->calls, $this->processes, $this->running_calls, $this->on_return, $this->on_timeout);
+            unset($this->calls, $this->processes, $this->running_calls, $this->on_return, $this->on_timeout, $this->call_count);
             $this->calls = $this->processes = $this->running_calls = array();
             $this->ipc_create();
             $this->daemon->on(Core_Daemon::ON_SIGNAL, array($this, 'signal'));
@@ -436,9 +446,9 @@ abstract class Core_Worker_Mediator implements Core_ITask
         // Different thresholds for parent & children
         $counter = function($type) use($that, $is_parent) {
             static $error_thresholds = array(
-                'identifier' => array(10,  50), // Identifier related errors: The underlying data structures are fine, but we need to re-create a resource handle (child, parent)
-                'corruption' => array(10,  25), // Corruption related errors: The underlying data structures are corrupt (or possibly just OOM)
-                'catchall'   => array(10,  25),
+                'communication' => array(10,  50), // Identifier related errors: The underlying data structures are fine, but we need to re-create a resource handle (child, parent)
+                'corruption'    => array(10,  25), // Corruption related errors: The underlying data structures are corrupt (or possibly just OOM)
+                'catchall'      => array(10,  25),
             );
 
             $that->error_counts[$type]++;
@@ -446,15 +456,13 @@ abstract class Core_Worker_Mediator implements Core_ITask
                 $that->fatal_error("IPC '$type' Error Threshold Reached");
             else
                 $that->log("Incrementing Error Count for {$type} to " . $that->error_counts[$type]);
-
-            die("log??????????????");
         };
 
         // Most of the error handling strategy is simply: Sleep for a moment and try again.
-        // We use a simple back-off strategy: starting with 2 seconds, it would increase to 8, then 16, etc
+        // Use a simple back-off that would start at, say, 2s, then go to 6s, 14s, 30s, etc
         // Return int
         $backoff = function($delay) use ($try) {
-            return $delay * pow(2, min($try, 1));
+            return $delay * pow(2, min(max($try, 1), 8)) - $delay;
         };
 
         // Create an array of random, moderate size and verify it can be written to shared memory
@@ -471,9 +479,11 @@ abstract class Core_Worker_Mediator implements Core_ITask
             case 0:             // Success
             case 4:             // System Interrupt
             case MSG_ENOMSG:    // No message of desired type
-            case MSG_EAGAIN:    // Temporary Problem, Try Again
-
                 // Ignored Errors
+                return true;
+                break;
+
+            case MSG_EAGAIN:    // Temporary Problem, Try Again
                 usleep($backoff(20000));
                 return true;
                 break;
@@ -485,6 +495,7 @@ abstract class Core_Worker_Mediator implements Core_ITask
             case 43:
                 // Identifier Removed
                 // A message queue was re-created at this address but the resource identifier we have needs to be re-created
+                $counter('communication');
                 if ($this->is_parent)
                     usleep($backoff(20000));
                 else
@@ -717,9 +728,9 @@ abstract class Core_Worker_Mediator implements Core_ITask
     }
 
     /**
-     * Called in the parent process, once per each iteration in the daemons run() loop. Checks messages queues for information from worker
-     * processes, and enforces timeouts when applicable.
-     * Note: Called only in the parent (daemon) process
+     * Called in each iteration of your daemon's event loop. Listens for worker Acks and enforces timeouts when applicable.
+     * Note: Called only in the parent (daemon) process, attached to the Core_Daemon::ON_PREEXECUTE event.
+     *
      * @return void
      */
     public function run() {
@@ -809,18 +820,14 @@ abstract class Core_Worker_Mediator implements Core_ITask
                 }
             }
 
-            // If we've killed all our processes -- either timeouts or maybe they fatal-errored -- and we have pending calls
-            // in the queue, create process(es) to run them.
+            // If we've killed all our processes -- either timeouts or maybe they fatal-errored -- and we have pending
+            // calls in the queue, fork()
             if (count($this->processes) == 0) {
                 $stat = $this->ipc_status();
                 if ($stat['messages'] > 0) {
                     $this->fork();
                 }
             }
-
-            // Run the Garbage Collector
-            if (mt_rand(1, 20) == 1)
-                $this->garbage_collector();
 
         } catch (Exception $e) {
             $this->log(__METHOD__ . ' Failed: ' . $e->getMessage(), true);
@@ -829,19 +836,23 @@ abstract class Core_Worker_Mediator implements Core_ITask
 
     /**
      * Starts the event loop in the Forked process that will listen for messages
-     * Note: Runs only in the child (forked) process
+     * Note: Runs only in the worker (forked) process
      * @return void
      */
     public function start() {
-        $count = 0;
+
         while(!$this->is_parent && !$this->shutdown) {
 
             // Give the CPU a break - Sleep for 1/20 a second.
             usleep(50000);
 
-            $max_jobs       = $count++ >= 25;
+            // Define automatic restart intervals. We want to add some entropy to avoid having all worker processes
+            // in a pool restart at the same time. Use a very crude technique to create a random number along a normal distribution.
+            $entropy = round((mt_rand(-1000, 1000) + mt_rand(-1000, 1000) + mt_rand(-1000, 1000)) / 100, 0);
+
+            $max_jobs       = $this->call_count++ >= (25 + $entropy);
             $min_runtime    = $this->daemon->runtime() >= (60 * 5);
-            $max_runtime    = $this->daemon->runtime() >= (60 * 30);
+            $max_runtime    = $this->daemon->runtime() >= (60 * 30 + $entropy * 10);
             $this->shutdown = ($max_runtime || $min_runtime && $max_jobs);
 
             if ($this->shutdown)
@@ -855,9 +866,6 @@ abstract class Core_Worker_Mediator implements Core_ITask
                 try {
                     $call_id = $this->message_decode($message);
                     $call = $this->calls[$call_id];
-
-                    if (($call_id == 18 || $call_id == 28 || $call_id == 38) && mt_rand(1,3) != 2)
-                        continue;
 
                     if ($call->status == self::CANCELLED) {
                         $this->log("Call {$call_id} Cancelled By Mediator -- Skipping...");
@@ -937,7 +945,7 @@ abstract class Core_Worker_Mediator implements Core_ITask
 
         $call->errors++;
         if ($this->ipc_error($error_code, $call->errors) && $call->errors < 3) {
-            $this->log("Message Encode Failed for call_id {$call_id}: Retrying.");
+            $this->log("Message Encode Failed for call_id {$call_id}: Retrying. Error Code: " . $error_code);
             return $this->message_encode($call_id);
         }
 
@@ -956,7 +964,7 @@ abstract class Core_Worker_Mediator implements Core_ITask
             case self::UNCALLED:
                 $decoder = function($message) use($that) {
                     $call = shm_get_var($that->shm, $message['call_id']);
-                    if ($message['microtime'] < $call->time[Core_Worker_Mediator::UNCALLED])    // Requeued - Cancel this call
+                    if ($message['microtime'] < $call->time[Core_Worker_Mediator::UNCALLED])    // Has been requeued - Cancel this call
                         $that->update_struct_status($call, Core_Worker_Mediator::CANCELLED);
 
                     return $call;
@@ -999,7 +1007,7 @@ abstract class Core_Worker_Mediator implements Core_ITask
         if (!is_object($call))
             throw new Exception(__METHOD__ . " Failed. Could Not Decode Message: " . print_r($message, true));
 
-        $this->calls[$call->id] = $call;
+        $this->calls[$call->id] = $this->merge_struct($call);
         return $call->id;
     }
 
@@ -1104,9 +1112,25 @@ abstract class Core_Worker_Mediator implements Core_ITask
      * @return void
      */
     public function update_struct_status(stdClass $call, $status) {
-        $call->status = $status;        // Periodically garbage-collect call structs: Keep the metadata but remove the (potentially large) args and return values
-        // The parent will also ensure any GC'd items are removed from shared memory though in normal operation they're deleted when they return
+        $call->status = $status;
         $call->time[$status] = microtime(true);
+    }
+
+    /**
+     * Merge the supplied $call with the canonical version in memory
+     * @param stdClass $call    A call struct pass to us from another process
+     * @return stdClass Return the supplied $call struct, now with details merged-in from the in-memory version.
+     */
+    public function merge_struct(stdClass $call) {
+
+        // This could end up being more sophisticated and complex.
+        // But for now, the real problem it's solving is that we set the CALLED status in the parent AFTER the struct
+        // is written to shared memory. So when it returns, we're losing the CALLED timestamp. Copy that over.
+        if (isset($this->calls[$call->id])) {
+            $call->time[self::CALLED] = $this->calls[$call->id]->time[self::CALLED];
+        }
+
+        return $call;
     }
 
     /**
@@ -1141,38 +1165,39 @@ abstract class Core_Worker_Mediator implements Core_ITask
         if (!$this->is_parent || count($called) == 0)
             return;
 
-        // We need to determine if we have any structs stuck in CALLED status. This could happen in a few scenarios:
-        // 1) There was a silent message-queue failure and the item was never presented to workers
-        // 2) A worker received the message but fatal-errored before acking
+        // We need to determine if we have any "dropped calls" in CALLED status. This could happen in a few scenarios:
+        // 1) There was a silent message-queue failure and the item was never presented to workers.
+        // 2) A worker received the message but fatal-errored before acking.
         // 3) A worker received the message but a message queue failure prevented the acks being sent.
         // @todo On the off chance #3 was true, the job may have been finished. Give a try to checking SHM for that and processing the result.
 
         // Look at all the jobs recently acked and determine which of them was called first. Get the time of that call as the $cutoff.
-        // Any structs in CALLED status since before that $cutoff will be requeued.
+        // Any structs in CALLED status that were called prior to that $cutoff have been dropped and will be requeued.
 
-        $cutoff = $this->calls[$this->call_count]->times[self::CALLED];
+        $cutoff = $this->calls[$this->call_count]->time[self::CALLED];
         foreach($this->processes as $process) {
-            if ($process->job === null && time() - $process->timestamp < 30)
+            if ($process->job === null && time() - $process->microtime < 30)
                 return; // Give processes time to ack their first job
 
-            $cutoff = min($cutoff, $this->calls[$process->job]->times[self::CALLED]);
+            if ($process->job !== null)
+                $cutoff = min($cutoff, $this->calls[$process->job]->time[self::CALLED]);
         }
 
         foreach($called as $call_id) {
             $call = $this->calls[$call_id];
-            if ($call->times[self::CALLED] > $cutoff)
+            if ($call->time[self::CALLED] > $cutoff)
                 continue;
 
             // If there's a retry count above our threshold log and skip to avoid endless requeueing
             if ($call->retries > 3) {
                 $this->update_struct_status($call, self::CANCELLED);
-                $this->error("Dormant Call. Requeue threshold reached. Call {$call->id} will not be requeued.");
+                $this->error("Dropped Call. Requeue threshold reached. Call {$call->id} will not be requeued.");
                 continue;
             }
 
             // Requeue the message. If somehow the original message is still out there the worker will compare timestamps
             // and mark the original call as CANCELLED.
-            $this->log("Dormant Call. Requeuing Call {$call->id} To `{$call->method}`");
+            $this->log("Dropped Call. Requeuing Call {$call->id} To `{$call->method}`");
 
             $call->retries++;
             $call->errors = 0;
@@ -1195,6 +1220,10 @@ abstract class Core_Worker_Mediator implements Core_ITask
     public function signal($signal) {
         switch ($signal)
         {
+            case SIGUSR1:
+                // kill -10 [pid]
+                $this->dump();
+                break;
             case SIGHUP:
                 if (!$this->is_parent)
                     $this->log("Restarting Worker Process...");
@@ -1203,7 +1232,83 @@ abstract class Core_Worker_Mediator implements Core_ITask
             case SIGTERM:
                 $this->shutdown = true;
                 break;
+
         }
+    }
+
+    /**
+     * Dump runtime stats in tabular fashion to the log.
+     * @return void
+     */
+    public function dump() {
+
+        $status_labels = array(
+            self::UNCALLED => 'Uncalled',
+            self::CALLED   => 'Called',
+            self::RUNNING  => 'Running',
+        );
+
+        // Compute the raw duration data for each call, grouped by method name and status
+        // (See how long we were in CALLED status waiting to run, how long we were RUNNING, etc)
+        $durations = array();
+        foreach($this->calls as $call) {
+            if (!isset($durations[$call->method]))
+                $durations[$call->method] = array();
+
+            foreach(array(self::CALLED, self::RUNNING) as $status) {
+                if (!isset($durations[$call->method][$status]))
+                    $durations[$call->method][$status] = array();
+
+                if (isset($call->time[$status+1]))
+                    $durations[$call->method][$status][] = max(round($call->time[$status+1] - $call->time[$status], 5), 0);
+            }
+        }
+
+        // Write out the header
+        // Then write out the data table with an indent
+
+        $out = array();
+        $out[] = "---------------------------------------------------------------------------------------------------";
+        $out[] = "Worker Runtime Statistics";
+        $out[] = "---------------------------------------------------------------------------------------------------";
+        $out[] = '';
+        $this->log(implode("\n", $out));
+
+        $out = array();
+        $out[] = 'Method Duration      Status           Mean     Median      Count';
+        $out[] = '================================================================';
+
+        foreach($durations as $method => $method_data) {
+            foreach ($method_data as $status => $status_data) {
+                $mean = $median = 0;
+                sort($status_data);
+                if ($count  = count($status_data)) {
+                    $mean   = round(array_sum($status_data) / $count, 5);
+                    $median = round($status_data[intval($count / 2)], 5);
+                }
+                $out[]  = sprintf('%s %s %s %s %s',
+                    str_pad(substr($method, 0, 20), 20, ' ', STR_PAD_RIGHT),
+                    str_pad($status_labels[$status], 10, ' ', STR_PAD_RIGHT),
+                    str_pad(number_format($mean, 5, '.', ''), 10, ' ', STR_PAD_LEFT),
+                    str_pad(number_format($median, 5, '.', ''), 10, ' ', STR_PAD_LEFT),
+                    str_pad(number_format($count, 0), 10, ' ', STR_PAD_LEFT)
+                );
+            }
+        }
+
+        $out[] = '';
+        $out[] = 'Error Type      Count';
+        $out[] = '=====================';
+
+        foreach($this->error_counts as $type => $count) {
+            $out[] = sprintf('%s %s',
+                str_pad(ucfirst($type), 15),
+                str_pad(number_format($count, 0), 5, ' ', STR_PAD_LEFT)
+            );
+        }
+
+        $this->log(implode("\n", $out), 1);
+        $this->log('');
     }
 
 
@@ -1218,8 +1323,8 @@ abstract class Core_Worker_Mediator implements Core_ITask
      * @param $message
      * @return void
      */
-    public function log($message) {
-        $this->daemon->log("$message", $this->alias);
+    public function log($message, $indent = 0) {
+        $this->daemon->log("$message", $this->alias, $indent);
     }
 
     /**
@@ -1358,11 +1463,13 @@ abstract class Core_Worker_Mediator implements Core_ITask
     }
 
     /**
-     * Set the number of concurrent workers. No limit is hard-coded, but processes are expensive and you should use
-     * the minimum number of workers necessary. In `lazy` forking strategy, the processes are forked one-by-one, as
-     * needed. This is avoided when your loop_interval is very short (we don't want to be forking processes if you
-     * need to loop every half second, for example) but it's the most ideal setting. Read more about the forking strategy
-     * for more information.
+     * Set the number of concurrent workers in the pool. No limit is enforced, but processes are expensive and you should use
+     * the minimum number of workers necessary. Too few workers will result in high latency situations and bigger risk
+     * that if your application needs to be restarted you'll lose buffered calls.
+     *
+     * In `lazy` forking strategy, the processes are forked one-by-one, as needed. This is avoided when your loop_interval
+     * is very short (we don't want to be forking processes if you need to loop every half second, for example) but it's
+     * the most ideal setting. Read more about the forking strategy for more information.
      *
      * Part of the Daemon API - Use from your daemon to set the number of concurrent asynchronous worker processes.
      *

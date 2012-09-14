@@ -1,5 +1,7 @@
 <?php
 
+namespace Examples\PrimeNumbers;
+
 /**
  * This Daemon has been created to demonstrate the Workers API in 2.0.
  *
@@ -10,7 +12,7 @@
  * described in the db.sql file.
  *
  */
-class Daemon extends Core_Daemon
+class Daemon extends \Core_Daemon
 {
     protected $loop_interval = 1;
 
@@ -42,7 +44,7 @@ class Daemon extends Core_Daemon
         // We also have other various settings defined in the ini, so we validate that the ini has both [signals] and [default] section
         // We're using the INI file here only because it's a conveinient way to demonstrate using the INI plugin.
 
-        $this->plugin('settings', new Core_Plugin_Ini());
+        $this->plugin('settings', new \Core_Plugin_Ini());
         $this->settings->filename = BASE_PATH . '/config/settings.ini';
         $this->settings->required_sections = array('signals', 'default');
     }
@@ -64,7 +66,7 @@ class Daemon extends Core_Daemon
         //      If you allocate to little memory, a WARNING will be logged to the Event log: Keep an eye out for it during your development process.
         //
         // - By convention, workers are named in UpperCase
-        // - Look at App_Prime to see the available methods. They are: sieve, is_prime, primes_among
+        // - Look at Workers_Primes to see the available methods. They are: sieve, is_prime, primes_among
 
         $this->worker('PrimeNumbers', new Workers_Primes());
         $this->PrimeNumbers->timeout(60);
@@ -147,7 +149,7 @@ class Daemon extends Core_Daemon
         // the workers. Load a configurable signal map from the loaded ini plugin
 
         $that = $this;
-        $this->on(Core_Daemon::ON_SIGNAL, function($signal) use($that) {
+        $this->on(\Core_Daemon::ON_SIGNAL, function($signal) use($that) {
             if (isset($that->settings['signals'][$signal])) {
                 $action = $that->settings['signals'][$signal];
 
@@ -171,7 +173,7 @@ class Daemon extends Core_Daemon
 
         // We may want to log results to the database directly from the workers. To do that we need to
 
-        $this->log("ExampleWorkers Daemon is Ready: To run a Factoring job, send signal 12. To run a Prime Numbers job, send signal 13. To toggle the random job-runner send signal 14.");
+        $this->log("PrimeNumbers Application is Ready: To run a Factoring job, send signal 12. To run a Prime Numbers job, send signal 13. To toggle the random job-runner send signal 14.");
     }
 
 
@@ -241,9 +243,8 @@ class Daemon extends Core_Daemon
             $rand = mt_rand(10000, 1000000);
             $primes = $this->PrimeNumbers->inline()->sieve($rand, $rand + $rand);
 
-            $this->log("Factors: " . print_r($this->GetFactors->inline("bef"), true));
-
-            // Remember, you're calling the method directly: Timeouts are not enforced. The onReturn callback is not called.
+            // Remember, you're calling the method directly:
+            // Timeouts are not enforced. The onReturn callback is not called.
             $this->log("Inline sieve() complete. Prime Numbers Returned: " . count($primes));
         }
     }
@@ -256,7 +257,7 @@ class Daemon extends Core_Daemon
      * @param stdClass $call
      * @return void
      */
-    public function job_return(stdClass $call) {
+    public function job_return(\stdClass $call) {
         $sql = sprintf('UPDATE jobs set is_complete=1, completed_at=NOW() where pid=%s and worker="%s" and job=%s', $this->pid(), $call->method, $call->id);
         if (false == mysqli_query($this->db, $sql))
             $this->reconnect_db($sql);
@@ -265,24 +266,37 @@ class Daemon extends Core_Daemon
     /**
      * Update the database record for the job specified by the $call struct
      * Intended to be used in an onTimeout callback, which is called by the Worker and passed an object w/
-     * all the call datails
+     * all the call details
      *
      * @param stdClass $call
      * @return void
      */
-    public function job_timeout(stdClass $call) {
+    public function job_timeout(\stdClass $call) {
         $sql = sprintf('UPDATE jobs set is_timeout=1, retries=%s, completed_at=NOW() where pid=%s and worker="%s" and job=%s',
                         $call->retries, $this->pid(), $call->method, $call->id);
         if (false == mysqli_query($this->db, $sql))
             $this->reconnect_db($sql);
     }
 
+    /**
+     * A common problem when using resources (like a MySQL Connection) in long-running, stateful apps like a Daemon is disconnected
+     * resources. If you check isResource, it will appear fine. But when you run queries you get errors like "MySQL Has Gone Away."
+     *
+     * Use a simple strategy in this Example. If the query returns false, pass it to this method to reconnect the DB and retry
+     * the original query. If that fails, log it. I'm a big fan personally of logging SQL queries after an error: Not only does it
+     * let you attempt the query to reproduce the failure, but if it's an insert or update you're going to preserve whatever state
+     * or data the query holds.
+     *
+     * @param $sql
+     */
     public function reconnect_db($sql) {
         usleep(25000);
         $this->db = mysqli_connect('localhost', 'root', 'root');
         mysqli_select_db($this->db, 'daemon');
-        if (!mysqli_query($this->db, $sql))
+        if (!mysqli_query($this->db, $sql)) {
             $this->log(mysqli_error($this->db));
+            $this->log($sql);
+        }
     }
 
     protected function log_file()

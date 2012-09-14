@@ -14,8 +14,8 @@ declare(ticks = 5);
 abstract class Core_Daemon
 {
     /**
-     * The daemon will attempt to restart itself it encounters a recoverable fatal error after it's been running
-     * for at least this many seconds. Prevents killing the server with process spawning if the error occurs at startup.
+     * The application will attempt to restart itself it encounters a recoverable fatal error after it's been running
+     * for at least this many seconds. Prevents killing the server with process forking if the error occurs at startup.
      * @var integer
      */
     const MIN_RESTART_SECONDS = 10;
@@ -24,17 +24,18 @@ abstract class Core_Daemon
      * Events can be attached to each state using the on() method
      * @var integer
      */
-    const ON_ERROR          = 0;
-    const ON_SIGNAL         = 1;
-    const ON_INIT           = 2;
-    const ON_PREEXECUTE     = 3;
-    const ON_POSTEXECUTE    = 4;
-    const ON_FORK           = 5;
-    const ON_PIDCHANGE      = 6;
-    const ON_SHUTDOWN       = 10;
+    const ON_ERROR          = 0;    // error() or fatal_error() is called
+    const ON_SIGNAL         = 1;    // the daemon has received a signal
+    const ON_INIT           = 2;    // the library has completed initialization, your setup() method is about to be called
+    const ON_PREEXECUTE     = 3;    // inside the event loop, right before your execute() method
+    const ON_POSTEXECUTE    = 4;    // and right after
+    const ON_FORK           = 5;    // in a background process right after it has been forked from the daemon
+    const ON_PIDCHANGE      = 6;    // whenever the pid changes -- in a background process for example
+    const ON_IDLE           = 7;    // called when there is idle time at the end of a loop_interval, or at the idle_probability when loop_interval isn't used
+    const ON_SHUTDOWN       = 10;   // called at the top of the destructor
 
     /**
-     * An array of instructions that's displayed when the -i param is passed into the daemon.
+     * An array of instructions that's displayed when the -i param is passed to the application.
      * Helps sysadmins and users of your daemons get installation correct. Guide them to set
      * correct permissions, supervisor/monit setup, crontab entries, init.d scripts, etc
      * @var Array
@@ -42,38 +43,60 @@ abstract class Core_Daemon
     protected $install_instructions = array();
 
     /**
-     * The frequency at which the run() loop will run (and execute() method will be called). After execute() is called, any remaining time in that
-     * interval will be spent in a sleep state. If there is no remaining time, that will be logged as an error condition.
+     * The frequency of the event loop. In seconds.
+     *
+     * In timer-based applications your execute() method will be called every $loop_interval seconds. Any remaining time
+     * at the end of an event loop iteration will dispatch an ON_IDLE event and your application will sleep(). If the
+     * event loop takes longer than the $loop_interval an error will be written to your application log.
+     *
      * @example $this->loop_interval = 300;     // execute() will be called once every 5 minutes
      * @example $this->loop_interval = 0.5;     // execute() will be called 2 times every second
      * @example $this->loop_interval = 0;       // execute() will be called immediately -- There will be no sleep.
-     * @var float    The interval in Seconds
+     *
+     * @var float The interval in Seconds
      */
     protected $loop_interval = null;
 
     /**
-     * The frequency (in seconds) at which the daemon will restart itself
+     * Control how often the ON_IDLE event fires in applications that do not use a $loop_interval timer.
+     *
+     * The ON_IDLE event gives your application (and the PHP Simple Daemon library) a way to defer work to be run
+     * when your application has idle time and would normally just sleep(). In timer-based applications that is very
+     * deterministic. In applications that don't use the $loop_interval timer, this probability factor applied in each
+     * iteration of the event loop to periodically dispatch ON_IDLE.
+     *
+     * Note: This value is completely ignored when using $loop_interval. In those cases, ON_IDLE is fired when there is
+     *       remaining time at the end of your loop.
+     *
+     * Note: If you want to take responsibility for dispatching the ON_IDLE event in your application, just set
+     *       this to 0 and dispatch the event periodically, eg:
+     *       $this->dispatch(array(self::ON_IDLE));
+     *
+     *
+     *
+     * @var float The probability, from 0.0 to 1.0.
+     */
+    protected $idle_probability = 0.1;
+
+    /**
+     * The frequency of your application restarting itself. In seconds.
+     *
      * @example $this->auto_restart_interval = 3600;    // Daemon will be restarted once an hour
-     * @example $this->auto_restart_interval = 86400;   // Daemon will be restarted once an day
-     * @var integer        The interval in Seconds
+     * @example $this->auto_restart_interval = 43200;   // Daemon will be restarted twice per day
+     * @example $this->auto_restart_interval = 86400;   // Daemon will be restarted once per day
+     *
+     * @var integer The interval in Seconds
      */
-    protected $auto_restart_interval = 86400;
+    protected $auto_restart_interval = 43200;
 
     /**
-     * Set this in your daemon to run a debug console to interact with your worker processes.
-     * @example Pass CLI argument: --debugworkers
-     * @var bool
-     */
-    protected $debug_workers = false;
-
-    /**
-     * If the process is forked, this will indicate whether we're still in the parent or not.
+     * Will be 'false' when running in a Task or Worker background process
      * @var boolean
      */
     private $is_parent = true;
 
     /**
-     * Timestamp when was the daemon started
+     * Timestamp when was the application started
      * @var integer
      */
     private $start_time;
@@ -85,7 +108,7 @@ abstract class Core_Daemon
     private $pid;
 
     /**
-     * Process ID of the parent daemon process
+     * Process ID of the parent (aka application) process
      * When in parent, it'll be the same as $pid
      * @var integer
      */
@@ -108,7 +131,7 @@ abstract class Core_Daemon
     private $daemon = false;
 
     /**
-     * Has a shutdown signal been received? If so, it will shutdown gracefully after your execute() method returns.
+     * Is your application shutting down at the end of the current event loop iteration?
      * @see Core_Daemon::shutdown()
      * @var boolean
      */
@@ -116,6 +139,9 @@ abstract class Core_Daemon
 
     /**
      * In verbose mode, every log entry is also dumped to stdout, as long as were not in daemon mode.
+     * Note: This was originally attached to a commandline option (-v) but it's not implicit based on whether the
+     *       application is being run inside your shell (verbose=true) or as a daemon (verbose=false)
+     *
      * @see Core_Daemon::verbose()
      * @var boolean
      */
@@ -150,6 +176,13 @@ abstract class Core_Daemon
      * @var Array
      */
     private $stats = array();
+
+    /**
+     * Set this in your daemon to run a debug console to interact with your worker processes.
+     * @example Pass CLI argument: --debugworkers
+     * @var bool
+     */
+    private $debug_workers = false;
 
     /**
      * By default, any buffered calls and acks between a daemon and its worker processes do not persist after a restart.
@@ -217,11 +250,13 @@ abstract class Core_Daemon
 
     /**
      * Return a log file name that will be used by the log() method.
-     * You could hard-code a string like './log', create a simple log rotator using the date() method, etc, etc
      *
-     * Note: For performance, the log file handle is kept open until the daemon shuts down. So this method will only
-     * be called once, during daemon setup. If you want to rotate logs every hour, for example, you can either
-     * overload the log() method or use the auto_restart_interval to restart the daemon every hour.
+     * You could hard-code a string like '/var/log/myapplog', read an option from an ini file, create a simple log
+     * rotator using the date() method, etc
+     *
+     * Note: This method will be called during startup and periodically afterwards, on even 5-minute intervals: If you
+     *       start your application at 13:01:00, the next check will be at 13:05:00, then 13:10:00, etc. This periodic
+     *       polling enables you to build simple log rotation behavior into your app.
      *
      * @return string
      */
@@ -257,7 +292,7 @@ abstract class Core_Daemon
 
     /**
      * Set the current Filename wherein this object is being instantiated and run.
-     * @param string $filename the acutal filename, pass in __file__
+     * @param string $filename the actual filename, pass in __file__
      * @return void
      */
     public static function setFilename($filename)
@@ -304,22 +339,22 @@ abstract class Core_Daemon
     protected function check_environment(Array $errors = array())
     {
         if (empty(self::$filename))
-            $errors[] = 'Filename is Missing: setFilename Must Be Called Before an Instance can be Initialized';
+            $errors[] = 'Filename is Missing: setFilename must be called before an instance can be initialized';
 
         if (is_numeric($this->loop_interval) == false)
             $errors[] = "Invalid Loop Interval: $this->loop_interval";
 
         if (empty($this->auto_restart_interval) || is_numeric($this->auto_restart_interval) == false)
-            $errors[] = "Invalid Auto Restart Interval: $this->auto_restart_interval";
+            $errors[] = "Invalid auto-restart interval: $this->auto_restart_interval";
 
         if (is_numeric($this->auto_restart_interval) && $this->auto_restart_interval < self::MIN_RESTART_SECONDS)
-            $errors[] = 'Auto Restart Inteval is Too Low. Minimum Value: ' . self::MIN_RESTART_SECONDS;
+            $errors[] = 'Auto-restart inteval is too low. Minimum value: ' . self::MIN_RESTART_SECONDS;
 
         if (function_exists('pcntl_fork') == false)
-            $errors[] = "The PCNTL Extension is Not Installed";
+            $errors[] = "The PCNTL Extension is not installed";
 
         if (version_compare(PHP_VERSION, '5.3.0') < 0)
-            $errors[] = "PHP 5.3 or Higher is Required";
+            $errors[] = "PHP 5.3 or higher is required";
 
         foreach ($this->plugins as $plugin)
             foreach ($this->{$plugin}->check_environment() as $error)
@@ -331,7 +366,7 @@ abstract class Core_Daemon
 
         if (count($errors)) {
             $errors = implode("\n  ", $errors);
-            throw new Exception("Core_Daemon::check_environment() Found The Following Errors:\n  $errors");
+            throw new Exception("Checking Dependencies... Failed:\n  $errors");
         }
     }
 
@@ -341,7 +376,6 @@ abstract class Core_Daemon
      */
     private function init()
     {
-        $this->loop_interval($this->loop_interval);
         $this->register_signal_handlers();
 
         foreach ($this->plugins as $plugin)
@@ -350,10 +384,15 @@ abstract class Core_Daemon
         foreach ($this->workers as $worker)
             $this->{$worker}->setup();
 
+        $this->loop_interval($this->loop_interval);
+
         // Our current use of the ON_INIT event is in the Lock provider plugins -- so we can prevent a duplicate daemon
         // process from starting-up. In that case, we want to do that check as early as possible. To accomplish that,
         // the plugin setup has to happen first -- to ensure the Lock provider plugins have a chance to load.
         $this->dispatch(array(self::ON_INIT));
+
+        // Queue any housekeeping tasks we want performed periodically
+        $this->on(self::ON_IDLE, array($this, 'stats_trim'), (empty($this->loop_interval)) ? null : ($this->loop_interval * 50)); // Throttle to about once every 50 iterations
 
         $this->setup();
         if (!$this->daemon)
@@ -411,7 +450,7 @@ abstract class Core_Daemon
         $accessors = array('loop_interval', 'is_parent', 'verbose', 'pid', 'shutdown');
         if (in_array($method, $accessors)) {
             if ($args)
-                trigger_error("The '$method' accessor can not be used as a setter in this context. Supplied arguments ignored.", E_WARNING);
+                trigger_error("The '$method' accessor can not be used as a setter in this context. Supplied arguments ignored.", E_USER_WARNING);
 
             return call_user_func_array(array($this, $method), array());
         }
@@ -454,10 +493,13 @@ abstract class Core_Daemon
      * your own events however you want.
      * @param $event mixed scalar  When creating custom events, keep ints < 100 reserved for the daemon
      * @param $callback closure|callback
+     * @param $throttle Optional time in seconds to throttle calls to the given $callback. For example, if
+     *        $throttle = 10, the provided $callback will not be called more than once every 10 seconds, even if the
+     *        given $event is dispatched more frequently than that.
      * @return array    The return value can be passed to off() to unbind the event
      * @throws Exception
      */
-    public function on($event, $callback)
+    public function on($event, $callback, $throttle = null)
     {
         if (!is_scalar($event))
             throw new Exception(__METHOD__ . ' Failed. Event type must be Scalar. Given: ' . gettype($event));
@@ -468,15 +510,15 @@ abstract class Core_Daemon
         if (!isset($this->callbacks[$event]))
             $this->callbacks[$event] = array();
 
-        $this->callbacks[$event][] = $callback;
+        $this->callbacks[$event][] = array('callback' => $callback, 'throttle' => $throttle, 'call_at' => 0);
         end($this->callbacks[$event]);
         return array($event, key($this->callbacks[$event]));
     }
 
     /**
      * Remove a callback previously registered with on(). Returns the callback.
-     * @param array $event
-     * @return callback|closure|null returns the registered event if $ref is valid
+     * @param array $event  Should be the array returned when you called on()
+     * @return callback|closure|null returns the registered event handler assuming $event is valid
      */
     public function off(Array $event)
     {
@@ -497,11 +539,27 @@ abstract class Core_Daemon
      */
     protected function dispatch(Array $event, Array $args = array())
     {
-        if (isset($event[0]) && isset($event[1]) && isset($this->callbacks[$event[0]][$event[1]]))
-            call_user_func_array($this->callbacks[$event[0]][$event[1]], $args);
-        elseif (isset($event[0]) && !isset($event[1]) && isset($this->callbacks[$event[0]]))
-            foreach($this->callbacks[$event[0]] as $callback)
-                call_user_func_array($callback, $args);
+        if (!isset($event[0]) || !isset($this->callbacks[$event[0]]))
+            return;
+
+        // A specific callback is being dispatched...
+        if (isset($event[1]) && isset($this->callbacks[$event[0]][$event[1]])) {
+            $callback =& $this->callbacks[$event[0]][$event[1]];
+            if (empty($callback['throttle']) || time() > $callback['call_at']) {
+                $callback['call_at'] = time() + (int)$callback['throttle'];
+                call_user_func_array($callback['callback'], $args);
+            }
+            return;
+        }
+
+        // All callbacks attached to a given event are being dispatched...
+        if (!isset($event[1]))
+            foreach($this->callbacks[$event[0]] as $callback_id => $callback) {
+                if (empty($callback['throttle']) || time() > $callback['call_at']) {
+                    $this->callbacks[$event[0]][$callback_id]['call_at'] = time() + (int)$callback['throttle'];
+                    call_user_func_array($callback['callback'], $args);
+                }
+            }
     }
 
     /**
@@ -548,7 +606,7 @@ abstract class Core_Daemon
                     $task->is_parent = false;
 
                 $task->setup();
-                call_user_func_array(array($task, 'start'), func_get_args());
+                call_user_func(array($task, 'start'));
                 $task->teardown();
             };
         } else {
@@ -580,7 +638,7 @@ abstract class Core_Daemon
                     if (!(is_array($callable) && $callable[0] == $this->{$object}))
                         unset($this->{$object});
 
-                $this->workers = $this->worker_pids = $this->plugins = array();
+                $this->workers = $this->worker_pids = $this->plugins = $this->stats = array();
                 $this->dispatch(array(self::ON_FORK));
 
                 try
@@ -603,32 +661,49 @@ abstract class Core_Daemon
     }
 
     /**
-     * Log the $message to the $this->log_file and possibly print to stdout.
-     * Multi-Line messages will be handled nicely. This code is pretty ugly but it works and it lets us avoid
-     * forcing another dependency for logging.
+     * Log the $message to the filename returned by Core_Daemon::log_file() and/or optionally print to stdout.
+     * Multi-Line messages will be handled nicely.
+     *
+     * Note: Your log_file() method will be called every 5 minutes (at even increments, eg 00:05, 00:10, 00:15, etc) to
+     * allow you to rotate the filename based on time (one log file per month, day, hour, whatever) if you wish.
+     *
+     * Note: You may find value in overloading this method in your app in favor of a more fully-featured logging tool
+     * like log4php or Zend_Log. There are fantastic logging libraries available, and this simplistic home-grown option
+     * was chosen specifically to avoid forcing another dependency on you.
+     *
      * @param string $message
-     * @param boolean $is_error    When true, an ON_ERROR event will be dispatched.
-     * @param string $label
+     * @param string $label Truncated at 12 chars
      */
-    public function log($message, $label = '')
+    public function log($message, $label = '', $indent = 0)
     {
         static $handle = false;
-        static $raise_logfile_error = true;
+        static $log_file = '';
+        static $log_file_check_at = 0;
+        static $log_file_error = false;
 
         $header = "\nDate                  PID   Label         Message\n";
         $date   = date("Y-m-d H:i:s");
         $pid    = str_pad($this->pid, 5, " ", STR_PAD_LEFT);
         $label  = str_pad(substr($label, 0, 12), 13, " ", STR_PAD_RIGHT);
-        $prefix = "[$date] $pid $label";
+        $prefix = "[$date] $pid $label" . str_repeat("\t", $indent);
+
+        if (time() >= $log_file_check_at && $this->log_file() != $log_file) {
+            $log_file = $this->log_file();
+            $log_file_check_at = mktime(date('H'), (date('i') - (date('i') % 5)) + 5, null);
+            @fclose($handle);
+            $handle = $log_file_error = false;
+        }
 
         if ($handle === false) {
-            if (strlen($this->log_file()) > 0 && $handle = @fopen($this->log_file(), 'a+')) {
-                fwrite($handle, $header);
-                if ($this->verbose)
-                    echo $header;
-            } elseif ($raise_logfile_error) {
-                $raise_logfile_error = false;
-                trigger_error(__CLASS__ . "Error: Could not write to logfile " . $this->log_file(), E_USER_NOTICE);
+            if (strlen($log_file) > 0 && $handle = @fopen($log_file, 'a+')) {
+                if ($this->is_parent) {
+                    fwrite($handle, $header);
+                    if ($this->verbose)
+                        echo $header;
+                }
+            } elseif (!$log_file_error) {
+                $log_file_error = true;
+                trigger_error(__CLASS__ . "Error: Could not write to logfile " . $log_file, E_USER_WARNING);
             }
         }
 
@@ -773,7 +848,7 @@ abstract class Core_Daemon
     {
         $workers = '';
         foreach($this->workers as $worker)
-            $workers .= sprintf('%s %s [%s], ', $worker, $this->{$worker}->id(), $this->{$worker}->is_idle() ? 'AVAILABLE' : 'RUNNING');
+            $workers .= sprintf('%s %s [%s], ', $worker, $this->{$worker}->id(), $this->{$worker}->is_idle() ? 'AVAILABLE' : 'BUFFERING');
 
         $pretty_memory = function($bytes) {
             $kb = 1024; $mb = $kb * 1024; $gb = $mb * 1024;
@@ -812,22 +887,24 @@ abstract class Core_Daemon
         $out[] = "---------------------------------------------------------------------------------------------------";
         $out[] = "Application Runtime Statistics";
         $out[] = "---------------------------------------------------------------------------------------------------";
+        $out[] = "Command:              " . ($this->is_parent ? $this->getFilename() : 'Forked Process from pid ' . $this->parent_pid);
         $out[] = "Loop Interval:        " . $this->loop_interval;
+        $out[] = "Idle Probability      " . $this->idle_probability;
         $out[] = "Restart Interval:     " . $this->auto_restart_interval;
         $out[] = sprintf("Start Time:           %s (%s)", $this->start_time, date('Y-m-d H:i:s', $this->start_time));
         $out[] = sprintf("Duration:             %s (%s)", $this->runtime(), $pretty_duration($this->runtime()));
         $out[] = "Log File:             " . $this->log_file();
         $out[] = "Daemon Mode:          " . $pretty_bool($this->daemon);
         $out[] = "Shutdown Signal:      " . $pretty_bool($this->shutdown);
-        $out[] = "Verbose Mode:         " . $pretty_bool($this->verbose);
-        $out[] = "Role:                 " . ($this->is_parent ? 'Parent' : 'Child');
-        $out[] = "Loaded Plugins:       " . implode(', ', $this->plugins);
-        $out[] = "Loaded Workers:       " . $workers;
+        $out[] = "Process Type:         " . ($this->is_parent ? 'Application Process' : 'Background Process');
+        $out[] = "Plugins:              " . implode(', ', $this->plugins);
+        $out[] = "Workers:              " . $workers;
         $out[] = sprintf("Memory:               %s (%s)", memory_get_usage(true), $pretty_memory(memory_get_usage(true)));
         $out[] = sprintf("Peak Memory:          %s (%s)", memory_get_peak_usage(true), $pretty_memory(memory_get_peak_usage(true)));
         $out[] = "Current User:         " . get_current_user();
         $out[] = "Priority:             " . pcntl_getpriority();
-        $out[] = "Loop duration, idle:  " . implode(', ', $this->stats_mean()) . ' (Mean Seconds)';
+        $out[] = "Loop: duration, idle: " . implode(', ', $this->stats_mean()) . ' (Mean Seconds)';
+        $out[] = "Stats sample size:    " . count($this->stats);
         $this->log(implode("\n", $out));
     }
 
@@ -838,18 +915,36 @@ abstract class Core_Daemon
      */
     private function timer($start = false)
     {
-        static $start_time = false;
+        static $start_time = null;
 
         // Start the Stop Watch and Return
         if ($start)
             return $start_time = microtime(true);
 
         // End the Stop Watch
+
+        // Determine if we should run the ON_IDLE tasks.
+        // In timer based applications, determine if we have remaining time.
+        // Otherwise apply the $idle_probability factor
+
+        $end_time = $probability = null;
+
+        if ($this->loop_interval)    $end_time = ($start_time + $this->loop_interval() - 0.01);
+        if ($this->idle_probability) $probability = (1 / $this->idle_probability);
+
+        $is_idle = function() use($end_time, $probability) {
+            if ($end_time)
+                return microtime(true) < $end_time;
+
+            if ($probability)
+                return mt_rand(1, $probability) == 1;
+
+            return false;
+        };
+
         // If we have idle time, do any housekeeping tasks
-        if (microtime(true) - $start_time > 0) {
-            if (mt_rand(1, 100) == 50 ) {
-                $this->stats = array_slice($this->stats, -100, 100);
-            }
+        if ($is_idle()) {
+            $this->dispatch(array(Core_Daemon::ON_IDLE), array($is_idle));
         }
 
         $stats = array();
@@ -867,7 +962,7 @@ abstract class Core_Daemon
             // Sleep for 1/100 a second.
             usleep(10000);
             if ($this->loop_interval > 0)
-                $this->error('Run Loop Taking Too Long. Duration: ' . $stats['duration'] . ' Interval: ' . $this->loop_interval);
+                $this->error('Run Loop Taking Too Long. Duration: ' . number_format($stats['duration'], 3) . ' Interval: ' . $this->loop_interval);
         }
 
         $this->stats[] = $stats;
@@ -1008,7 +1103,7 @@ abstract class Core_Daemon
         if (!$this->is_parent)
             // While in theory there is nothing preventing you from creating workers in child processes, supporting it
             // would require changing a lot of error handling and process management code and I don't really see the value in it.
-            throw new Exception(__METHOD__ . ' Failed. You cannot create workers in a forked (child) processes.');
+            throw new Exception(__METHOD__ . ' Failed. You cannot create workers in a background processes.');
 
         $this->check_alias($alias);
 
@@ -1018,6 +1113,15 @@ abstract class Core_Daemon
                     $mediator = new Core_Worker_Debug_ObjectMediator($alias, $this);
                 else
                     $mediator = new Core_Worker_ObjectMediator($alias, $this);
+
+                // Ensure that there are no reserved method names in the worker object -- Determine if there will
+                // be a collision between worker methods and public methods on the Mediator class
+                // Exclude any methods required by the Core_IWorker interface from the check.
+                $intersection = array_intersect(get_class_methods($worker), get_class_methods($mediator));
+                $intersection = array_diff($intersection, get_class_methods('Core_IWorker'));
+                if (!empty($intersection))
+                    throw new Exception(sprintf('%s Failed. Your worker class "%s" contains restricted method names: %s.',
+                        __METHOD__, get_class($worker), implode(', ', $intersection)));
 
                 $mediator->setObject($worker);
                 break;
@@ -1236,10 +1340,10 @@ abstract class Core_Daemon
     }
 
     /**
-     * Return a tuple containing the mean duration and idle time of the daemons event loop, ignoring the longest and shortest 5%
+     * Return a list containing the mean duration and idle time of the daemons event loop, ignoring the longest and shortest 5%
      * Note: Stats data is trimmed periodically and is not likely to have more than 200 rows.
      * @param int $last  Limit the working set to the last n iteration
-     * @return Array A tuple as array(duration,idle) averages.
+     * @return Array A list as array(duration, idle) averages.
      */
     public function stats_mean($last = 100)
     {
@@ -1262,23 +1366,30 @@ abstract class Core_Daemon
         $data = array_slice($data, $n, $count);
 
         // Now compute the corrected mean
-        $tuple = array(0,0);
+        $list = array(0, 0);
         if ($count) {
             for($i=0; $i<$count; $i++) {
-                $tuple[0] += $data[$i]['duration'];
-                $tuple[1] += $data[$i]['idle'];
+                $list[0] += $data[$i]['duration'];
+                $list[1] += $data[$i]['idle'];
             }
 
-            $tuple[0] /= $count;
-            $tuple[1] /= $count;
+            $list[0] /= $count;
+            $list[1] /= $count;
         }
 
-        return $tuple;
+        return $list;
     }
 
     /**
-     * Combination getter/setter for the $is_parent property. Can be called manually inside a forked process.
-     * Used automatically when creating named workers.
+     * A method to periodically trim older items from the stats array
+     * @return void
+     */
+    public function stats_trim() {
+        $this->stats = array_slice($this->stats, -100, 100);
+    }
+
+    /**
+     * Combination getter/setter for the $is_parent property. Can be called manually inside a background process.
      * @param boolean $set_value
      * @return boolean
      */
